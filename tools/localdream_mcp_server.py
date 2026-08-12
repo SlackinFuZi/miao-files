@@ -15,12 +15,8 @@ localdream_mcp_server.py — Local Dream MCP 桥接服务器（Termux 运行）
 
 用法（Termux）：
   pkg install -y python
-  termux-setup-storage            # 授权存储（保存图片到 ~/storage/pictures/LocalDreamMCP）
+  termux-setup-storage
   python3 localdream_mcp_server.py --port 8000 [--token xxx]
-
-Rikka 配置：
-  设置 → MCP → + → Streamable HTTP → http://127.0.0.1:8000/mcp
-  （开了 --token 就在 headers 加 Authorization: Bearer xxx）
 """
 import argparse
 import base64
@@ -38,8 +34,6 @@ PROTOCOL_VERSION = "2025-06-18"
 LD_BACKEND = os.environ.get("LD_BACKEND", "http://127.0.0.1:8081")
 SAVE_DIR = os.path.expanduser(os.environ.get("LD_SAVE_DIR", "~/storage/pictures/LocalDreamMCP"))
 
-_lock = threading.Lock()
-
 
 def ld_health():
     try:
@@ -56,25 +50,16 @@ def ld_generate(prompt, negative="", steps=25, cfg=7.0, denoise=0.6,
     if not seed:
         seed = int(time.time() * 1000) % (2 ** 32)
     body = {
-        "prompt": prompt,
-        "negative_prompt": negative,
-        "steps": int(steps),
-        "cfg": float(cfg),
-        "denoise_strength": float(denoise),
-        "width": int(width),
-        "height": int(height),
-        "seed": int(seed),
-        "scheduler": "dpm",
-        "output_format": output_format,   # 只认 raw/jpeg/png
-        "preview_format": "raw",
+        "prompt": prompt, "negative_prompt": negative, "steps": int(steps),
+        "cfg": float(cfg), "denoise_strength": float(denoise),
+        "width": int(width), "height": int(height), "seed": int(seed),
+        "scheduler": "dpm", "output_format": output_format, "preview_format": "raw",
     }
     if image_b64:
-        body["image"] = image_b64           # 有图 = img2img
-
+        body["image"] = image_b64
     req = urllib.request.Request(f"{LD_BACKEND}/generate", data=json.dumps(body).encode(),
                                  method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "User-Agent": "ld-mcp"})
+                                 headers={"Content-Type": "application/json", "User-Agent": "ld-mcp"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         final = None
         for raw in r:
@@ -132,9 +117,13 @@ def save_image(img_bytes, ext, prompt):
 
 
 def _ensure_valid_image(img_bytes, width, height):
-    """校验图片字节：损坏/无文件头 → 按 raw RGB(A) 恢复（修复噪点化）"""
-    if img_bytes[:2] == b"\xff\xd8" or img_bytes[:4] == b"\x89PNG" or img_bytes[:6] in (b"GIF89a", b"GIF87a"):
-        return img_bytes, "keep"
+    """校验图片字节：返回 (字节, 正确扩展名)。损坏/无文件头 → 按 raw RGB(A) 恢复"""
+    if img_bytes[:2] == b"\xff\xd8":
+        return img_bytes, "jpg"
+    if img_bytes[:4] == b"\x89PNG":
+        return img_bytes, "png"
+    if img_bytes[:6] in (b"GIF89a", b"GIF87a"):
+        return img_bytes, "gif"
     if len(img_bytes) == width * height * 3:
         return _raw_to_png(img_bytes, width, height), "png"
     if len(img_bytes) == width * height * 4:
@@ -147,7 +136,7 @@ def _ensure_valid_image(img_bytes, width, height):
             return buf.getvalue(), "png"
         except Exception:
             pass
-    return img_bytes, "keep"
+    return img_bytes, "bin"
 
 
 def tool_generate(args):
@@ -164,15 +153,13 @@ def tool_generate(args):
             steps=int((args or {}).get("steps", 25)),
             cfg=float((args or {}).get("cfg", 7.0)),
             denoise=float((args or {}).get("denoise", 0.6)),
-            width=width,
-            height=height,
+            width=width, height=height,
             seed=int((args or {}).get("seed", 0)) or None,
             image_b64=(args or {}).get("image_base64", "") or None,
         )
         img_bytes, fmt = _ensure_valid_image(img_bytes, width, height)
         fpath = save_image(img_bytes, fmt, prompt)
-        return {"status": "ok", "saved_to": fpath,
-                "size": f"{len(img_bytes)/1024:.0f}KB",
+        return {"status": "ok", "saved_to": fpath, "size": f"{len(img_bytes)/1024:.0f}KB",
                 "hint": f"图片已保存到 {fpath}，可去相册/文件管理器查看"}
     except Exception as e:
         return {"error": str(e)[:300]}
@@ -183,38 +170,20 @@ def tool_status(_):
 
 
 TOOLS = [
-    {
-        "name": "localdream_generate",
-        "description": "用手机上的 Local Dream 生成图片（txt2img 或 img2img）。"
-                       "支持参考图（image_base64 传 base64 图片则按 img2img 处理，denoise 越低越保留原图）。"
-                       "生成后保存到手机相册目录并返回路径。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "生成提示词（英文效果最佳）"},
-                "negative_prompt": {"type": "string", "description": "负面提示词"},
-                "image_base64": {"type": "string", "description": "可选：参考图 base64（带 data: 前缀也可）"},
-                "denoise": {"type": "number", "description": "img2img 去噪强度 0-1，默认 0.6"},
-                "steps": {"type": "integer", "description": "采样步数，默认 25"},
-                "cfg": {"type": "number", "description": "CFG，默认 7"},
-                "width": {"type": "integer", "description": "宽，默认 512（SD1.5）"},
-                "height": {"type": "integer", "description": "高，默认 512"},
-                "seed": {"type": "integer", "description": "随机种子，默认自动"},
-            },
-            "required": ["prompt"],
-        },
-    },
-    {
-        "name": "localdream_status",
-        "description": "检查 Local Dream 后端是否在线（模型是否加载）。",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
+    {"name": "localdream_generate",
+     "description": "用手机上的 Local Dream 生成图片（txt2img 或 img2img）。支持参考图（image_base64 传 base64 图片则 img2img，denoise 越低越保留原图）。生成后保存到手机相册目录并返回路径。",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "negative_prompt": {"type": "string"},
+         "image_base64": {"type": "string"}, "denoise": {"type": "number"},
+         "steps": {"type": "integer"}, "cfg": {"type": "number"},
+         "width": {"type": "integer"}, "height": {"type": "integer"},
+         "seed": {"type": "integer"}}, "required": ["prompt"]}},
+    {"name": "localdream_status",
+     "description": "检查 Local Dream 后端是否在线（模型是否加载）。",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
-HANDLERS = {
-    "localdream_generate": tool_generate,
-    "localdream_status": tool_status,
-}
+HANDLERS = {"localdream_generate": tool_generate, "localdream_status": tool_status}
 
 
 def handle_request(body, token):
@@ -222,14 +191,11 @@ def handle_request(body, token):
         msg = json.loads(body)
     except Exception:
         return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, False
-
     method = msg.get("method", "")
     msg_id = msg.get("id")
     is_notification = "id" not in msg
-
     if method == "initialize":
-        result = {"protocolVersion": PROTOCOL_VERSION,
-                  "capabilities": {"tools": {}},
+        result = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
                   "serverInfo": {"name": "localdream-mcp", "version": "1.0.0"}}
     elif method == "notifications/initialized":
         return None, True
@@ -251,7 +217,6 @@ def handle_request(body, token):
                 result = {"content": [{"type": "text", "text": json.dumps({"error": str(e)}, ensure_ascii=False)}], "isError": True}
     else:
         return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}, False
-
     if is_notification:
         return None, True
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}, False
@@ -340,11 +305,9 @@ def main():
     ap.add_argument("--token", default=os.environ.get("LD_MCP_TOKEN", ""))
     ap.add_argument("--backend", default=LD_BACKEND)
     args = ap.parse_args()
-
     LD_BACKEND = args.backend
     if not SAVE_DIR.startswith("/"):
         SAVE_DIR = os.path.expanduser(SAVE_DIR)
-
     print(f"✅ localdream-mcp 启动: http://{args.host}:{args.port}/mcp")
     print(f"   后端: {LD_BACKEND}   保存目录: {SAVE_DIR}")
     if args.token:
